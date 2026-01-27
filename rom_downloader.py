@@ -667,7 +667,7 @@ class ConfigGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("ROM Downloader Configuration")
-        self.root.geometry("600x600") # Slightly shorter height needed now
+        self.root.geometry("600x530") # Slightly shorter height needed now
         
         self.entries = {}
         
@@ -682,16 +682,16 @@ class ConfigGUI:
         path_frame = ttk.LabelFrame(parent, text="Paths & Files", padding="10")
         path_frame.pack(fill="x", pady=5)
         
-        self.add_path_row(path_frame, 0, "INPUT_PATH", "Source (DAT/Folder):", True)
-        self.add_path_row(path_frame, 1, "DOWNLOAD_FOLDER", "Download Dest:", False)
-        self.add_path_row(path_frame, 2, "URL_MAPPING_FILE", "Mapping File (TXT):", True)
+        self.add_path_row(path_frame, 0, "INPUT_PATH", "FixDATs Source (DAT/Folder):", mode="both")
+        self.add_path_row(path_frame, 1, "DOWNLOAD_FOLDER", "Download Folder:", False)
+        self.add_path_row(path_frame, 2, "URL_MAPPING_FILE", "URL Mapping File:", True)
 
         # --- PERFORMANCE SECTION (Grouped) ---
         perf_frame = ttk.LabelFrame(parent, text="Performance", padding="10")
         perf_frame.pack(fill="x", pady=5)
         
-        self.add_small_entry(perf_frame, 0, 0, "MAIN_THREADS", "Game Threads:")
-        self.add_small_entry(perf_frame, 0, 2, "SUB_THREAD_WORKERS", "Sub-threads:")
+        self.add_small_entry(perf_frame, 0, 0, "MAIN_THREADS", "Concurrent Game/Machine/Disk Downloads:")
+        self.add_small_entry(perf_frame, 0, 2, "SUB_THREAD_WORKERS", "Concurrent ROM Downloads:")
 
         # --- NETWORK SECTION (Grouped) ---
         net_frame = ttk.LabelFrame(parent, text="Network", padding="10")
@@ -727,20 +727,38 @@ class ConfigGUI:
         ttk.Button(parent, text="SAVE SETTINGS & START", command=self.save_and_run).pack(pady=20, fill='x')
 
     # --- GUI HELPERS ---
-    def add_path_row(self, parent, row, key, label, is_file):
+
+    def add_path_row(self, parent, row, key, label, mode="file"):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="e", padx=5, pady=2)
         entry = ttk.Entry(parent)
         entry.insert(0, str(CONFIG[key]))
         entry.grid(row=row, column=1, sticky="ew", padx=5, pady=2)
-        parent.columnconfigure(1, weight=1) # Make entry expand
+        parent.columnconfigure(1, weight=1) 
         
-        def browse():
-            res = filedialog.askopenfilename() if is_file else filedialog.askdirectory()
+        button_frame = ttk.Frame(parent)
+        button_frame.grid(row=row, column=2, padx=2)
+
+        def browse_file():
+            res = filedialog.askopenfilename()
             if res:
                 entry.delete(0, tk.END)
                 entry.insert(0, res)
-        
-        ttk.Button(parent, text="...", width=3, command=browse).grid(row=row, column=2, padx=2)
+
+        def browse_folder():
+            res = filedialog.askdirectory()
+            if res:
+                entry.delete(0, tk.END)
+                entry.insert(0, res)
+
+        if mode == "both":
+            # Two small buttons for File or Folder
+            ttk.Button(button_frame, text="File", width=5, command=browse_file).pack(side="left", padx=1)
+            ttk.Button(button_frame, text="Folder", width=6, command=browse_folder).pack(side="left", padx=1)
+        else:
+            # Single button logic
+            cmd = browse_file if mode == True or mode == "file" else browse_folder
+            ttk.Button(button_frame, text="...", width=3, command=cmd).pack()
+
         self.entries[key] = entry
 
     def add_small_entry(self, parent, row, col, key, label, val_override=None):
@@ -779,7 +797,15 @@ class ConfigGUI:
             CONFIG["FILE_PERMISSIONS"] = int(self.entries["FILE_PERMISSIONS"].get(), 8)
 
             if not CONFIG["INPUT_PATH"]:
-                messagebox.showerror("Error", "Please select an Input Path.")
+                messagebox.showerror("Error", "Please select a FixDAT file/folder.")
+                return
+
+            if not CONFIG["DOWNLOAD_FOLDER"]:
+                messagebox.showerror("Error", "Please select a Download Path.")
+                return
+
+            if not CONFIG["URL_MAPPING_FILE"]:
+                messagebox.showerror("Error", "Please select a path for url_mapping.txt.")
                 return
 
             # SAVE CONFIG TO DISK
