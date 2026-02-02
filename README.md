@@ -12,6 +12,7 @@ A robust, multi-threaded tool to download ROMs based on DAT files (e.g., Redump,
 * **Smart Parsing:** Handles XML DAT files, detects MIA (Missing in Action) files, and ignores them.
 * **Recursive Crawling:** Scans nested folder structures on remote servers (configurable amount of sub-directories).
 * **Progress Tracking:** Real-time progress bars with colorized console output.
+* **URL_Mapping Source Filter (Disable sources) 
 
 ## Installation
 
