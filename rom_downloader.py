@@ -71,6 +71,9 @@ CONFIG = {
     "FUZZY_THRESHOLD": 0.90,
     "RECURSION_DEPTH": 2,
     "INTERACTIVE_MODE": False,
+    "DISABLED_DOMAINS": [],
+    "GUI_GEOMETRY": "",
+    "DOMAIN_FILTER_GEOMETRY": "",
     "MAIN_THREADS": 4
 }
 
@@ -292,6 +295,35 @@ def ensure_download_folder(path):
             sys.exit(1)
     else:
         _set_path_permissions(path, CONFIG["FOLDER_PERMISSIONS"], is_folder=True)
+
+
+# --- DOMAIN FILTERING ---
+def _normalize_domain(netloc: str) -> str:
+    """Normalizes a network location into a comparable domain key."""
+    if not netloc:
+        return ""
+    netloc = netloc.strip().lower()
+    # strip port
+    if ":" in netloc:
+        netloc = netloc.split(":", 1)[0]
+    # strip leading www.
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    return netloc
+
+def _domain_from_url(url: str) -> str:
+    try:
+        return _normalize_domain(urlparse(url).netloc)
+    except Exception:
+        return ""
+
+def _disabled_domains_set() -> set:
+    raw = CONFIG.get("DISABLED_DOMAINS") or []
+    return { _normalize_domain(d) for d in raw if isinstance(d, str) and d.strip() }
+
+def _is_domain_disabled(url: str, disabled_domains: set) -> bool:
+    d = _domain_from_url(url)
+    return bool(d) and d in disabled_domains
 
 # --- MAPPING IO ---
 def load_url_mappings(filename):
@@ -543,7 +575,7 @@ def process_single_game(game_name, game_info, source_urls, available_links_cache
     else:
         return False, f"{Fore.RED}[MISSING] '{game_name}'{Style.RESET_ALL}"
 
-def _resolve_dat_source_urls(dat_name, url_mappings, available_links_cache, interactive_mode):
+def _resolve_dat_source_urls(dat_name, url_mappings, available_links_cache, interactive_mode, disabled_domains):
     original_urls = url_mappings.get(dat_name)
     processed_urls = set()
     
@@ -578,8 +610,11 @@ def _resolve_dat_source_urls(dat_name, url_mappings, available_links_cache, inte
             return None
         url_mappings[dat_name] = [user_input]
         save_url_mappings(CONFIG["URL_MAPPING_FILE"], url_mappings)
-        return _resolve_dat_source_urls(dat_name, url_mappings, available_links_cache, interactive_mode)
+        return _resolve_dat_source_urls(dat_name, url_mappings, available_links_cache, interactive_mode, disabled_domains)
 
+    # Apply domain filters (does not modify mappings)
+    if disabled_domains:
+        processed_urls = {u for u in processed_urls if not _is_domain_disabled(u, disabled_domains)}
     return sorted(list(processed_urls))
 
 # --- CORE LOGIC (Decoupled from CLI/GUI) ---
@@ -596,7 +631,8 @@ def run_downloader():
 
     ensure_download_folder(CONFIG["DOWNLOAD_FOLDER"])
     url_mappings = load_url_mappings(CONFIG["URL_MAPPING_FILE"])
-    available_links_cache = {} 
+    available_links_cache = {}
+    disabled_domains = _disabled_domains_set() 
     
     missing_mapping_dats = []
     processed_count = 0
@@ -630,12 +666,12 @@ def run_downloader():
                 log.info(f"{Fore.YELLOW}Skipped deletion (kept empty).{Style.RESET_ALL}")
             continue
 
-        source_urls = _resolve_dat_source_urls(dat_name, url_mappings, available_links_cache, CONFIG["INTERACTIVE_MODE"])
+        source_urls = _resolve_dat_source_urls(dat_name, url_mappings, available_links_cache, CONFIG["INTERACTIVE_MODE"], disabled_domains)
         
         if dat_name not in url_mappings or not url_mappings[dat_name]:
-            source_urls = _resolve_dat_source_urls(dat_name, url_mappings, available_links_cache, CONFIG["INTERACTIVE_MODE"])
+            source_urls = _resolve_dat_source_urls(dat_name, url_mappings, available_links_cache, CONFIG["INTERACTIVE_MODE"], disabled_domains)
         else:
-            source_urls = _resolve_dat_source_urls(dat_name, url_mappings, available_links_cache, False)
+            source_urls = _resolve_dat_source_urls(dat_name, url_mappings, available_links_cache, False, disabled_domains)
 
         if not source_urls:
             if dat_name in url_mappings and url_mappings[dat_name] and url_mappings[dat_name] != ['none']:
@@ -700,29 +736,61 @@ class ConfigGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("ROM Downloader Configuration")
-        self.root.geometry("600x530") # Slightly shorter height needed now
-        
+
+        # Window size (remembered)
+        default_geom = "720x720"
+        geom = CONFIG.get("GUI_GEOMETRY") or default_geom
+        try:
+            self.root.geometry(geom)
+        except Exception:
+            self.root.geometry(default_geom)
+        self.root.minsize(720, 720)
+        self.root.resizable(True, True)
+
         self.entries = {}
-        
+
         # Main container with padding
         main_frame = ttk.Frame(root, padding="10")
         main_frame.pack(fill="both", expand=True)
 
         self.create_widgets(main_frame)
 
+        # Save window geometry on close
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    # --- Window persistence ---
+    def _persist_geometry(self):
+        try:
+            CONFIG["GUI_GEOMETRY"] = self.root.winfo_geometry()
+            save_config()
+        except Exception:
+            pass
+
+    def on_close(self):
+        self._persist_geometry()
+        self.root.destroy()
+
+    # --- UI creation ---
     def create_widgets(self, parent):
         # --- PATHS SECTION (Full Width) ---
         path_frame = ttk.LabelFrame(parent, text="Paths & Files", padding="10")
         path_frame.pack(fill="x", pady=5)
-        
+
         self.add_path_row(path_frame, 0, "INPUT_PATH", "FixDATs Source (DAT/Folder):", mode="both")
-        self.add_path_row(path_frame, 1, "DOWNLOAD_FOLDER", "Download Folder:", False)
-        self.add_path_row(path_frame, 2, "URL_MAPPING_FILE", "URL Mapping File:", True)
+        self.add_path_row(path_frame, 1, "DOWNLOAD_FOLDER", "Download Folder:", mode=False)
+        self.add_path_row(path_frame, 2, "URL_MAPPING_FILE", "URL Mapping File:", mode=True)
+
+        # Domain filter UI (does not alter url_mapping.txt)
+        ttk.Button(
+            path_frame,
+            text="Edit Domain Filters",
+            command=self.open_domain_filter_dialog
+        ).grid(row=3, column=1, sticky="w", padx=5, pady=(6, 2))
 
         # --- PERFORMANCE SECTION (Grouped) ---
         perf_frame = ttk.LabelFrame(parent, text="Performance", padding="10")
         perf_frame.pack(fill="x", pady=5)
-        
+
         self.add_small_entry(perf_frame, 0, 0, "MAIN_THREADS", "Concurrent Game/Machine/Disk Downloads:")
         self.add_small_entry(perf_frame, 0, 2, "SUB_THREAD_WORKERS", "Concurrent ROM Downloads:")
 
@@ -740,34 +808,31 @@ class ConfigGUI:
 
         self.add_small_entry(scrape_frame, 0, 0, "FUZZY_THRESHOLD", "Fuzzy Match (0-1):")
         self.add_small_entry(scrape_frame, 0, 2, "RECURSION_DEPTH", "Recurse Depth:")
-        
-        # Checkboxes on the next row within the same frame
+
         self.add_checkbox(scrape_frame, 1, 0, "DELETE_EMPTY_DATS", "Delete Empty DATs")
         self.add_checkbox(scrape_frame, 1, 2, "INTERACTIVE_MODE", "Interactive Mode")
 
         # --- PERMISSIONS (Grouped) ---
         perm_frame = ttk.LabelFrame(parent, text="Permissions (Octal)", padding="10")
         perm_frame.pack(fill="x", pady=5)
-        
-        # Format octals for display
+
         f_val = oct(CONFIG["FOLDER_PERMISSIONS"]).replace("0o", "")
         self.add_small_entry(perm_frame, 0, 0, "FOLDER_PERMISSIONS", "Folder (e.g. 777):", val_override=f_val)
-        
+
         p_val = oct(CONFIG["FILE_PERMISSIONS"]).replace("0o", "")
         self.add_small_entry(perm_frame, 0, 2, "FILE_PERMISSIONS", "File (e.g. 666):", val_override=p_val)
 
         # --- ACTION BUTTON ---
-        ttk.Button(parent, text="SAVE SETTINGS & START", command=self.save_and_run).pack(pady=20, fill='x')
+        ttk.Button(parent, text="SAVE SETTINGS & START", command=self.save_and_run).pack(pady=20, fill="x")
 
-    # --- GUI HELPERS ---
-
+    # --- GUI helper widgets ---
     def add_path_row(self, parent, row, key, label, mode="file"):
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="e", padx=5, pady=2)
         entry = ttk.Entry(parent)
-        entry.insert(0, str(CONFIG[key]))
+        entry.insert(0, str(CONFIG.get(key, "")))
         entry.grid(row=row, column=1, sticky="ew", padx=5, pady=2)
-        parent.columnconfigure(1, weight=1) 
-        
+        parent.columnconfigure(1, weight=1)
+
         button_frame = ttk.Frame(parent)
         button_frame.grid(row=row, column=2, padx=2)
 
@@ -784,36 +849,173 @@ class ConfigGUI:
                 entry.insert(0, res)
 
         if mode == "both":
-            # Two small buttons for File or Folder
             ttk.Button(button_frame, text="File", width=5, command=browse_file).pack(side="left", padx=1)
             ttk.Button(button_frame, text="Folder", width=6, command=browse_folder).pack(side="left", padx=1)
         else:
-            # Single button logic
-            cmd = browse_file if mode == True or mode == "file" else browse_folder
+            cmd = browse_file if mode is True or mode == "file" else browse_folder
             ttk.Button(button_frame, text="...", width=3, command=cmd).pack()
 
         self.entries[key] = entry
 
     def add_small_entry(self, parent, row, col, key, label, val_override=None):
         ttk.Label(parent, text=label).grid(row=row, column=col, sticky="e", padx=(10, 5), pady=2)
-        entry = ttk.Entry(parent, width=8) # Small width
-        val = val_override if val_override is not None else str(CONFIG[key])
+        entry = ttk.Entry(parent, width=10)
+        val = val_override if val_override is not None else str(CONFIG.get(key, ""))
         entry.insert(0, val)
-        entry.grid(row=row, column=col+1, sticky="w", padx=0, pady=2)
+        entry.grid(row=row, column=col + 1, sticky="w", padx=0, pady=2)
         self.entries[key] = entry
 
     def add_checkbox(self, parent, row, col, key, label):
-        var = tk.BooleanVar(value=CONFIG[key])
+        var = tk.BooleanVar(value=bool(CONFIG.get(key, False)))
         ttk.Checkbutton(parent, text=label, variable=var).grid(row=row, column=col, columnspan=2, sticky="w", padx=10, pady=2)
         self.entries[key] = var
 
+    # --- Domain filtering dialog ---
+    @staticmethod
+    def _normalize_domain(url: str) -> str:
+        try:
+            parsed = urlparse(url)
+            host = (parsed.netloc or "").strip().lower()
+            if host.startswith("www."):
+                host = host[4:]
+            # drop port if present
+            host = host.split(":")[0]
+            return host
+        except Exception:
+            return ""
+
+    def _collect_domains_from_mapping(self, mapping_path: str):
+        domains = set()
+        try:
+            url_mappings = load_url_mappings(mapping_path)
+        except Exception:
+            url_mappings = {}
+
+        for _, urls in url_mappings.items():
+            if not urls:
+                continue
+            for u in urls:
+                if not u or str(u).lower() == "none":
+                    continue
+                d = self._normalize_domain(u)
+                if d:
+                    domains.add(d)
+        return sorted(domains)
+
+    def open_domain_filter_dialog(self):
+        mapping_path = self.entries.get("URL_MAPPING_FILE").get() if "URL_MAPPING_FILE" in self.entries else CONFIG.get("URL_MAPPING_FILE", "")
+        if not mapping_path or not os.path.exists(mapping_path):
+            messagebox.showerror("Error", "URL mapping file not found. Please select a valid url_mapping.txt first.")
+            return
+
+        # Ensure config keys exist
+        CONFIG.setdefault("DISABLED_DOMAINS", [])
+        disabled = set([d.lower() for d in CONFIG.get("DISABLED_DOMAINS", []) if d])
+
+        domains = self._collect_domains_from_mapping(mapping_path)
+        if not domains:
+            messagebox.showinfo("No domains found", "No valid source domains were found in the mapping file.")
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Domain Filters")
+        default_geom = "700x520"
+        geom = CONFIG.get("DOMAIN_FILTER_GEOMETRY") or default_geom
+        try:
+            win.geometry(geom)
+        except Exception:
+            win.geometry(default_geom)
+        win.minsize(600, 400)
+        win.resizable(True, True)
+
+        ttk.Label(
+            win,
+            text=("Uncheck any domain you want to disable. "
+                  "Disabled domains will be skipped during crawling and downloading."),
+            wraplength=660
+        ).pack(pady=(10, 6), padx=10, anchor="w")
+
+        # Scrollable list
+        container = ttk.Frame(win)
+        container.pack(fill="both", expand=True, padx=10)
+
+        canvas = tk.Canvas(container, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        scroll_frame = ttk.Frame(canvas)
+
+        scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # Mousewheel scrolling (Windows/macOS/Linux)
+        def _on_mousewheel(event):
+            # Windows: event.delta is multiples of 120
+            if hasattr(event, "delta") and event.delta:
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            else:
+                # Linux uses Button-4/5
+                if event.num == 4:
+                    canvas.yview_scroll(-3, "units")
+                elif event.num == 5:
+                    canvas.yview_scroll(3, "units")
+
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        canvas.bind_all("<Button-4>", _on_mousewheel)
+        canvas.bind_all("<Button-5>", _on_mousewheel)
+
+        vars_map = {}
+        for i, dom in enumerate(domains):
+            v = tk.BooleanVar(value=(dom not in disabled))
+            cb = ttk.Checkbutton(scroll_frame, text=dom, variable=v)
+            cb.grid(row=i, column=0, sticky="w", padx=5, pady=2)
+            vars_map[dom] = v
+
+        btn_row = ttk.Frame(win)
+        btn_row.pack(fill="x", padx=10, pady=10)
+
+        def _persist_dialog_geometry():
+            try:
+                CONFIG["DOMAIN_FILTER_GEOMETRY"] = win.winfo_geometry()
+                save_config()
+            except Exception:
+                pass
+
+        def save_and_close():
+            new_disabled = [d for d, v in vars_map.items() if not v.get()]
+            CONFIG["DISABLED_DOMAINS"] = sorted(set([d.lower() for d in new_disabled]))
+            _persist_dialog_geometry()
+            save_config()
+            win.destroy()
+
+        def enable_all():
+            for v in vars_map.values():
+                v.set(True)
+
+        def disable_all():
+            for v in vars_map.values():
+                v.set(False)
+
+        ttk.Button(btn_row, text="Enable All", command=enable_all).pack(side="left")
+        ttk.Button(btn_row, text="Disable All", command=disable_all).pack(side="left", padx=(8, 0))
+        ttk.Button(btn_row, text="Save", command=save_and_close).pack(side="right")
+
+        def on_close():
+            _persist_dialog_geometry()
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+
+    # --- Save and run ---
     def save_and_run(self):
         try:
             # Update CONFIG from GUI
             CONFIG["INPUT_PATH"] = self.entries["INPUT_PATH"].get()
             CONFIG["DOWNLOAD_FOLDER"] = self.entries["DOWNLOAD_FOLDER"].get()
             CONFIG["URL_MAPPING_FILE"] = self.entries["URL_MAPPING_FILE"].get()
-            
+
             CONFIG["MAIN_THREADS"] = int(self.entries["MAIN_THREADS"].get())
             CONFIG["SUB_THREAD_WORKERS"] = int(self.entries["SUB_THREAD_WORKERS"].get())
             CONFIG["TIMEOUT"] = int(self.entries["TIMEOUT"].get())
@@ -821,7 +1023,7 @@ class ConfigGUI:
             CONFIG["RETRY_DELAY"] = int(self.entries["RETRY_DELAY"].get())
             CONFIG["FUZZY_THRESHOLD"] = float(self.entries["FUZZY_THRESHOLD"].get())
             CONFIG["RECURSION_DEPTH"] = int(self.entries["RECURSION_DEPTH"].get())
-            
+
             CONFIG["DELETE_EMPTY_DATS"] = self.entries["DELETE_EMPTY_DATS"].get()
             CONFIG["INTERACTIVE_MODE"] = self.entries["INTERACTIVE_MODE"].get()
 
@@ -832,14 +1034,15 @@ class ConfigGUI:
             if not CONFIG["INPUT_PATH"]:
                 messagebox.showerror("Error", "Please select a FixDAT file/folder.")
                 return
-
             if not CONFIG["DOWNLOAD_FOLDER"]:
                 messagebox.showerror("Error", "Please select a Download Path.")
                 return
-
             if not CONFIG["URL_MAPPING_FILE"]:
                 messagebox.showerror("Error", "Please select a path for url_mapping.txt.")
                 return
+
+            # Persist geometry before starting
+            self._persist_geometry()
 
             # SAVE CONFIG TO DISK
             save_config()
@@ -849,6 +1052,7 @@ class ConfigGUI:
 
         except ValueError as e:
             messagebox.showerror("Input Error", f"Invalid value: {e}")
+
 
 def main():
     # Load saved config first
@@ -913,8 +1117,11 @@ if __name__ == "__main__":
         print(" [CRITICAL ERROR] The script crashed unexpectedly.")
         print(" See the error trace above for details.")
         print("!" * 60)
-        input("Press Enter to exit...")
         sys.exit(1)
     finally:
-        print("\nPress Enter to exit...")
-        input()
+        # Pause so the console window doesn't close immediately when double-clicked.
+        try:
+            print("\nPress Enter to exit...")
+            input()
+        except EOFError:
+            pass
