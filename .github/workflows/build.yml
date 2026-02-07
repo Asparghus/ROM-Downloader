@@ -28,12 +28,12 @@ jobs:
     - name: Install Dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install requests beautifulsoup4 colorama tqdm pyinstaller
+        pip install requests beautifulsoup4 colorama tqdm pyqt5 pyinstaller
 
     # 4. Build the executable with PyInstaller
     - name: Build with PyInstaller
       run: |
-        pyinstaller --onefile --name "ROM_Downloader" rom_downloader.py
+        pyinstaller --onefile --noconsole --name "ROM_Downloader" --hidden-import PyQt5 --collect-all PyQt5 rom_downloader.py
 
     # 5. Upload the EXE as an Artifact (Available on every commit in 'Actions' tab)
     - name: Upload Build Artifact

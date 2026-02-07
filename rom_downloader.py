@@ -9,18 +9,14 @@ import argparse
 import logging
 import json
 import xml.etree.ElementTree as ET
+import ctypes 
 from urllib.parse import urljoin, urlparse, unquote, urlunparse
 from difflib import get_close_matches
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# --- GUI IMPORTS ---
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-
-# --- DEPENDENCY CHECK (Skipped if frozen by PyInstaller) ---
+# --- DEPENDENCY CHECK ---
 def check_dependencies():
     """Checks for required third-party libraries."""
-    # If running as compiled exe, skip check
     if getattr(sys, 'frozen', False):
         return
 
@@ -28,7 +24,8 @@ def check_dependencies():
         ("requests", "requests"),
         ("bs4", "beautifulsoup4"),
         ("colorama", "colorama"),
-        ("tqdm", "tqdm")
+        ("tqdm", "tqdm"),
+        ("PyQt5", "PyQt5")
     ]
     missing = []
     for import_name, package_name in required_packages:
@@ -54,13 +51,23 @@ from bs4 import BeautifulSoup
 from colorama import Fore, Style, init
 from tqdm import tqdm
 
+# PyQt5 Imports - Hard dependency for PyInstaller to detect
+from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
+                                QFormLayout, QLabel, QLineEdit, QPushButton, 
+                                QFileDialog, QCheckBox, QGroupBox, QMessageBox, 
+                                QScrollArea, QDialog, QDialogButtonBox, QGridLayout,
+                                QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView, 
+                                QProgressBar, QStyledItemDelegate)
+from PyQt5.QtCore import Qt, QSettings, QThread, pyqtSignal, QObject
+from PyQt5.QtGui import QFont, QIcon, QPalette, QColor, QTextCursor
+
 init(autoreset=True)
 
-# --- GLOBAL CONFIGURATION (Populated by Arguments or GUI) ---
+# --- GLOBAL CONFIGURATION ---
 CONFIG = {
-    "INPUT_PATH": "", # Added for GUI context
+    "INPUT_PATH": "", 
     "URL_MAPPING_FILE": "url_mapping.txt",
-    "DOWNLOAD_FOLDER": os.path.join(os.getcwd(), "Downloads"), # Default to local folder
+    "DOWNLOAD_FOLDER": os.path.join(os.getcwd(), "Downloads"),
     "TIMEOUT": 60,
     "RETRY_DELAY": 5,
     "MAX_RETRIES": 3,
@@ -74,25 +81,25 @@ CONFIG = {
     "DISABLED_DOMAINS": [],
     "GUI_GEOMETRY": "",
     "DOMAIN_FILTER_GEOMETRY": "",
-    "MAIN_THREADS": 4
+    "MAIN_THREADS": 4,
+    "SHOW_NONE_DATS": False,
+    "SHOW_PROCESSED_DATS": False,
+    "SHOW_DELETED_DATS": False
 }
 
 # --- CONFIG PERSISTENCE ---
 CONFIG_FILE = "config.json"
 
 def load_config():
-    """Loads settings from config.json if it exists, overriding defaults."""
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r') as f:
                 saved_config = json.load(f)
-                # Update GLOBAL CONFIG with saved values
                 CONFIG.update(saved_config)
         except Exception as e:
-            log.warning(f"{Fore.YELLOW}[WARN] Could not load config file: {e}{Style.RESET_ALL}")
+            pass
 
 def save_config():
-    """Saves the current global CONFIG to config.json."""
     try:
         with open(CONFIG_FILE, 'w') as f:
             json.dump(CONFIG, f, indent=4)
@@ -100,8 +107,14 @@ def save_config():
         log.error(f"{Fore.RED}[ERROR] Could not save config file: {e}{Style.RESET_ALL}")
 
 # --- INITIALIZE CONFIG ---
-# Call this immediately after the CONFIG dictionary definition in your code
 load_config() 
+
+# --- GLOBAL SIGNALS BRIDGE ---
+class WorkerSignals(QObject):
+    progress = pyqtSignal(str, int, str) # Filename, Percent, Speed/Status
+    finished = pyqtSignal(str)           # Filename finished
+
+GUI_SIGNALS = None  # Will be initialized in the GUI
 
 # --- LOGGING SETUP ---
 log = logging.getLogger()
@@ -131,7 +144,11 @@ class TqdmLoggingHandler(logging.StreamHandler):
         try:
             msg = self.format(record)
             with log_lock:
-                tqdm.write(msg)
+                # If GUI is running, simple print (redirected), else tqdm write
+                if GUI_SIGNALS:
+                    print(msg)
+                else:
+                    tqdm.write(msg)
         except Exception:
             self.handleError(record)
 
@@ -255,17 +272,16 @@ def extract_download_urls_from_profile(profile_url):
 
     try:
         soup = BeautifulSoup(response.text, "html.parser")
-        search_area = soup
         if "archive.org" in urlparse(profile_url).netloc.lower():
             main_content = soup.find("main", id="maincontent")
             if main_content:
-                search_area = main_content
+                soup = main_content
 
         found_urls = set()
         archive_link_pattern = re.compile(r"^/details/([^/@][^/]*)$")
         base_for_join = response.url if response.url.endswith('/') else response.url + '/'
 
-        for link in search_area.find_all("a"):
+        for link in soup.find_all("a"):
             href = link.get("href")
             if not href: continue
             absolute_href = urljoin(base_for_join, href)
@@ -299,14 +315,11 @@ def ensure_download_folder(path):
 
 # --- DOMAIN FILTERING ---
 def _normalize_domain(netloc: str) -> str:
-    """Normalizes a network location into a comparable domain key."""
     if not netloc:
         return ""
     netloc = netloc.strip().lower()
-    # strip port
     if ":" in netloc:
         netloc = netloc.split(":", 1)[0]
-    # strip leading www.
     if netloc.startswith("www."):
         netloc = netloc[4:]
     return netloc
@@ -413,14 +426,13 @@ def crawl_links_recursive(start_url, cache, max_depth, current_depth=0):
 
     try:
         soup = BeautifulSoup(response.text, "html.parser")
-        search_area = soup
         if "archive.org" in urlparse(start_url).netloc.lower():
             main_content = soup.find("main", id="maincontent")
             if main_content:
-                search_area = main_content
+                soup = main_content
         base_for_join = response.url if response.url.endswith('/') else response.url + '/'
 
-        for link in search_area.find_all("a"):
+        for link in soup.find_all("a"):
             href = link.get("href")
             if not href or href.strip() == '' or href.startswith(('?', '#', 'javascript:', 'mailto:')): continue
             if href in ['../', './', '/']: continue
@@ -459,19 +471,45 @@ def download_file(url, destination_path, file_display_name="Unknown"):
     temp_path = destination_path + ".part"
     file_display = os.path.basename(destination_path)
 
+    # --- GUI MODE CHECK ---
+    is_gui_mode = (GUI_SIGNALS is not None)
+    
     try:
         with open(temp_path, "wb") as file:
-            with tqdm(total=total_size, unit='B', unit_scale=True, desc=f"{Fore.BLUE}{file_display[:20]:<20}{Style.RESET_ALL}", leave=False, ncols=100) as bar:
+            
+            if is_gui_mode:
+                # GUI Mode: Manual chunk reading and signal emission
+                downloaded = 0
+                start_time = time.time()
                 for chunk in response.iter_content(chunk_size=32768):
                     if chunk:
                         file.write(chunk)
-                        bar.update(len(chunk))
+                        downloaded += len(chunk)
+                        
+                        # Calculate percentage and speed
+                        percent = int((downloaded / total_size) * 100) if total_size > 0 else 0
+                        elapsed = time.time() - start_time
+                        speed_mb = (downloaded / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                        status_text = f"{speed_mb:.1f} MB/s"
+                        
+                        GUI_SIGNALS.progress.emit(file_display, percent, status_text)
+            else:
+                # CLI Mode: Use TQDM
+                with tqdm(total=total_size, unit='B', unit_scale=True, desc=f"{Fore.BLUE}{file_display[:20]:<20}{Style.RESET_ALL}", leave=False, ncols=100) as bar:
+                    for chunk in response.iter_content(chunk_size=32768):
+                        if chunk:
+                            file.write(chunk)
+                            bar.update(len(chunk))
 
         if total_size > 0 and os.path.getsize(temp_path) != total_size:
             raise IOError("Incomplete download")
         
         os.rename(temp_path, destination_path)
         _set_path_permissions(destination_path, CONFIG["FILE_PERMISSIONS"])
+        
+        if is_gui_mode:
+            GUI_SIGNALS.finished.emit(file_display)
+            
         return True
     except Exception as e:
         log.warning(f"{Fore.YELLOW}[FAIL] Download error {file_display}: {e}{Style.RESET_ALL}")
@@ -483,11 +521,8 @@ def download_file(url, destination_path, file_display_name="Unknown"):
             except Exception: pass
 
 def get_fuzzy_match(target_name, candidates, threshold=0.9):
-    # 1. Ask for top 3 matches (instead of 1). 
-    #    If the 1st match has wrong numbers, we can check the 2nd.
     matches = get_close_matches(target_name, candidates.keys(), n=3, cutoff=threshold)
     
-    # Helper: extracts a set of numbers from a string (e.g. "Game 01-96" -> {'01', '96'})
     def get_numbers(s):
         return set(re.findall(r'\d+', s))
 
@@ -495,9 +530,6 @@ def get_fuzzy_match(target_name, candidates, threshold=0.9):
 
     for match in matches:
         match_nums = get_numbers(match)
-        
-        # 2. THE GUARD: Only accept the match if the numbers are identical
-        #    This prevents "Vol 1" matching "Vol 2"
         if target_nums == match_nums:
             return match, candidates[match]
             
@@ -612,12 +644,11 @@ def _resolve_dat_source_urls(dat_name, url_mappings, available_links_cache, inte
         save_url_mappings(CONFIG["URL_MAPPING_FILE"], url_mappings)
         return _resolve_dat_source_urls(dat_name, url_mappings, available_links_cache, interactive_mode, disabled_domains)
 
-    # Apply domain filters (does not modify mappings)
     if disabled_domains:
         processed_urls = {u for u in processed_urls if not _is_domain_disabled(u, disabled_domains)}
     return sorted(list(processed_urls))
 
-# --- CORE LOGIC (Decoupled from CLI/GUI) ---
+# --- CORE LOGIC ---
 def run_downloader():
     if not CONFIG["INPUT_PATH"] or not os.path.exists(CONFIG["INPUT_PATH"]):
         log.critical(f"Input path not found or not set: {CONFIG.get('INPUT_PATH')}")
@@ -635,8 +666,9 @@ def run_downloader():
     disabled_domains = _disabled_domains_set() 
     
     missing_mapping_dats = []
-    processed_count = 0
-    deleted_count = 0
+    mapping_none_dats = []
+    processed_dats = []
+    deleted_dats = []
 
     log.info(f"{Fore.GREEN}Starting processing with {CONFIG['MAIN_THREADS']} threads.{Style.RESET_ALL}")
     
@@ -660,7 +692,7 @@ def run_downloader():
             log.info(f"Empty DAT (MIA only or no roms).")
             if CONFIG["DELETE_EMPTY_DATS"]:
                 os.remove(dat_path)
-                deleted_count += 1
+                deleted_dats.append(dat_filename)
                 log.info(f"{Fore.YELLOW}Deleted empty DAT.{Style.RESET_ALL}")
             else:
                 log.info(f"{Fore.YELLOW}Skipped deletion (kept empty).{Style.RESET_ALL}")
@@ -676,6 +708,9 @@ def run_downloader():
         if not source_urls:
             if dat_name in url_mappings and url_mappings[dat_name] and url_mappings[dat_name] != ['none']:
                 log.warning(f"{Fore.RED}[FAIL] Mapping exists but no links found. Check the URL content: {url_mappings[dat_name]}{Style.RESET_ALL}")
+            elif url_mappings[dat_name] == ['none']:
+                log.warning(f"{Fore.RED}[SKIP] URL for '{dat_name}' mapped as none on url_mappings.txt{Style.RESET_ALL}")
+                mapping_none_dats.append(dat_name)
             else:
                 log.warning(f"{Fore.RED}[SKIP] No URL mapping found for '{dat_name}'{Style.RESET_ALL}")
                 missing_mapping_dats.append(dat_name)
@@ -704,7 +739,10 @@ def run_downloader():
             for future in as_completed(future_to_game):
                 try:
                     success, msg = future.result()
-                    tqdm.write(msg)
+                    # Print without extra newline if using GUI stream
+                    if GUI_SIGNALS: print(msg)
+                    else: tqdm.write(msg)
+                    
                     if success: successful_games += 1
                     else: failed_games += 1
                 except Exception as exc:
@@ -715,176 +753,147 @@ def run_downloader():
         
         if failed_games == 0 and successful_games > 0:
             log.info(f"{Fore.GREEN}DAT Complete. Deleting DAT file.{Style.RESET_ALL}")
-            try: os.remove(dat_path); deleted_count += 1
+            try: os.remove(dat_path); deleted_dats.append(dat_filename)
             except: pass
         
-        processed_count += 1
+        processed_dats.append(dat_name)
 
     print(f"\n{Fore.BLUE}{'='*30}{Style.RESET_ALL}")
     print(f"{Fore.GREEN}Run Complete.{Style.RESET_ALL}")
-    print(f"Processed: {processed_count}")
-    print(f"Deleted: {deleted_count}")
+
+    if processed_dats:
+        if CONFIG.get("SHOW_PROCESSED_DATS", False):
+            print(f"\n{Fore.BLUE}Processed DATs ({len(processed_dats)}):{Style.RESET_ALL}")
+            for d in processed_dats: print(f" - {d}")
+        else:
+            print(f"Processed: {len(processed_dats)}")
+
+    if deleted_dats:
+        if CONFIG.get("SHOW_DELETED_DATS", False):
+            print(f"\n{Fore.BLUE}Deleted DATs ({len(deleted_dats)}):{Style.RESET_ALL}")
+            for d in deleted_dats: print(f" - {d}")
+        else:
+            print(f"Deleted: {len(deleted_dats)}")
     
     if missing_mapping_dats:
-        print(f"\n{Fore.RED}The following DATs were skipped due to missing URL mappings:{Style.RESET_ALL}")
+        print(f"\n{Fore.BLUE}Missing URL mappings:{Style.RESET_ALL}")
         for d in missing_mapping_dats:
             print(f" - {d}")
         print(f"{Fore.YELLOW}(Enable Interactive Mode to fix these on next run){Style.RESET_ALL}")
 
-# --- CONFIG GUI CLASS ---
-class ConfigGUI:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("ROM Downloader Configuration")
+    if mapping_none_dats:
+        if CONFIG.get("SHOW_NONE_DATS", False):
+             print(f"\n{Fore.BLUE}'None' Mappings ({len(mapping_none_dats)}):{Style.RESET_ALL}")
+             for d in mapping_none_dats:
+                print(f" - {d}")
+        else:
+             print(f"Skipped 'None' Mappings: {len(mapping_none_dats)}")
+        print(f"{Fore.YELLOW}(Edit the URL mappings file to fix these on next run){Style.RESET_ALL}")
 
-        # Window size (remembered)
-        default_geom = "720x720"
-        geom = CONFIG.get("GUI_GEOMETRY") or default_geom
+# --- THREADING & LOGGING HELPERS ---
+class StreamRedirector(QObject):
+    """Redirects print() and logging output to a PyQt signal."""
+    text_written = pyqtSignal(str)
+
+    def write(self, text):
+        self.text_written.emit(str(text))
+    
+    def flush(self):
+        pass
+
+class DownloadWorker(QThread):
+    """Runs the downloader logic in a separate thread."""
+    finished = pyqtSignal()
+
+    def run(self):
         try:
-            self.root.geometry(geom)
-        except Exception:
-            self.root.geometry(default_geom)
-        self.root.minsize(720, 720)
-        self.root.resizable(True, True)
+            run_downloader()
+        except Exception as e:
+            print(f"Error in worker: {e}")
+        finally:
+            self.finished.emit()
 
-        self.entries = {}
-
-        # Main container with padding
-        main_frame = ttk.Frame(root, padding="10")
-        main_frame.pack(fill="both", expand=True)
-
-        self.create_widgets(main_frame)
-
-        # Save window geometry on close
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-
-    # --- Window persistence ---
-    def _persist_geometry(self):
+# --- PYQT5 GUI CLASSES ---
+class DomainFilterDialog(QDialog):
+    def __init__(self, parent=None, mapping_path=""):
+        super().__init__(parent)
+        self.setWindowTitle("Domain Filters")
+        
+        # --- Force Dark Title Bar (Windows) ---
         try:
-            CONFIG["GUI_GEOMETRY"] = self.root.winfo_geometry()
-            save_config()
+            hwnd = self.winId()
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                int(hwnd), 20, ctypes.byref(ctypes.c_int(1)), 4
+            )
         except Exception:
             pass
 
-    def on_close(self):
-        self._persist_geometry()
-        self.root.destroy()
+        # --- Window Geometry ---
+        geom = CONFIG.get("DOMAIN_FILTER_GEOMETRY")
+        geometry_set = False
+        if geom:
+            try:
+                w, h = map(int, geom.split('x'))
+                self.resize(w, h)
+                geometry_set = True
+            except: 
+                pass
 
-    # --- UI creation ---
-    def create_widgets(self, parent):
-        # --- PATHS SECTION (Full Width) ---
-        path_frame = ttk.LabelFrame(parent, text="Paths & Files", padding="10")
-        path_frame.pack(fill="x", pady=5)
+        if not geometry_set:
+            self.resize(467, 590) 
 
-        self.add_path_row(path_frame, 0, "INPUT_PATH", "FixDATs Source (DAT/Folder):", mode="both")
-        self.add_path_row(path_frame, 1, "DOWNLOAD_FOLDER", "Download Folder:", mode=False)
-        self.add_path_row(path_frame, 2, "URL_MAPPING_FILE", "URL Mapping File:", mode=True)
+        layout = QVBoxLayout(self)
 
-        # Domain filter UI (does not alter url_mapping.txt)
-        ttk.Button(
-            path_frame,
-            text="Edit Domain Filters",
-            command=self.open_domain_filter_dialog
-        ).grid(row=3, column=1, sticky="w", padx=5, pady=(6, 2))
+        info_lbl = QLabel("Uncheck any domain you want to disable. Disabled domains will be skipped during crawling and downloading.")
+        info_lbl.setWordWrap(True)
+        layout.addWidget(info_lbl)
 
-        # --- PERFORMANCE SECTION (Grouped) ---
-        perf_frame = ttk.LabelFrame(parent, text="Performance", padding="10")
-        perf_frame.pack(fill="x", pady=5)
+        # Scroll Area
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_content = QWidget()
+        self.scroll_layout = QVBoxLayout(self.scroll_content)
+        self.scroll_area.setWidget(self.scroll_content)
+        layout.addWidget(self.scroll_area)
 
-        self.add_small_entry(perf_frame, 0, 0, "MAIN_THREADS", "Concurrent Game/Machine/Disk Downloads:")
-        self.add_small_entry(perf_frame, 0, 2, "SUB_THREAD_WORKERS", "Concurrent ROM Downloads:")
+        # Logic
+        self.checkboxes = {}
+        domains = self._collect_domains_from_mapping(mapping_path)
+        
+        CONFIG.setdefault("DISABLED_DOMAINS", [])
+        disabled = set([d.lower() for d in CONFIG.get("DISABLED_DOMAINS", []) if d])
 
-        # --- NETWORK SECTION (Grouped) ---
-        net_frame = ttk.LabelFrame(parent, text="Network", padding="10")
-        net_frame.pack(fill="x", pady=5)
+        if not domains:
+             self.scroll_layout.addWidget(QLabel("No valid source domains found in mapping file."))
+        
+        for dom in domains:
+            cb = QCheckBox(dom)
+            cb.setChecked(dom not in disabled)
+            self.scroll_layout.addWidget(cb)
+            self.checkboxes[dom] = cb
+        
+        self.scroll_layout.addStretch()
 
-        self.add_small_entry(net_frame, 0, 0, "TIMEOUT", "Timeout (s):")
-        self.add_small_entry(net_frame, 0, 2, "MAX_RETRIES", "Max Retries:")
-        self.add_small_entry(net_frame, 0, 4, "RETRY_DELAY", "Retry Delay (s):")
+        # Buttons
+        btn_layout = QHBoxLayout()
+        btn_enable_all = QPushButton("Enable All")
+        btn_disable_all = QPushButton("Disable All")
+        btn_save = QPushButton("Save")
+        btn_cancel = QPushButton("Cancel")
 
-        # --- SCRAPING & LOGIC (Grouped) ---
-        scrape_frame = ttk.LabelFrame(parent, text="Scraping & Logic", padding="10")
-        scrape_frame.pack(fill="x", pady=5)
+        btn_enable_all.clicked.connect(self.enable_all)
+        btn_disable_all.clicked.connect(self.disable_all)
+        btn_save.clicked.connect(self.save_and_close)
+        btn_cancel.clicked.connect(self.reject)
 
-        self.add_small_entry(scrape_frame, 0, 0, "FUZZY_THRESHOLD", "Fuzzy Match (0-1):")
-        self.add_small_entry(scrape_frame, 0, 2, "RECURSION_DEPTH", "Recurse Depth:")
+        btn_layout.addWidget(btn_enable_all)
+        btn_layout.addWidget(btn_disable_all)
+        btn_layout.addStretch()
+        btn_layout.addWidget(btn_save)
+        btn_layout.addWidget(btn_cancel)
+        layout.addLayout(btn_layout)
 
-        self.add_checkbox(scrape_frame, 1, 0, "DELETE_EMPTY_DATS", "Delete Empty DATs")
-        self.add_checkbox(scrape_frame, 1, 2, "INTERACTIVE_MODE", "Interactive Mode")
-
-        # --- PERMISSIONS (Grouped) ---
-        perm_frame = ttk.LabelFrame(parent, text="Permissions (Octal)", padding="10")
-        perm_frame.pack(fill="x", pady=5)
-
-        f_val = oct(CONFIG["FOLDER_PERMISSIONS"]).replace("0o", "")
-        self.add_small_entry(perm_frame, 0, 0, "FOLDER_PERMISSIONS", "Folder (e.g. 777):", val_override=f_val)
-
-        p_val = oct(CONFIG["FILE_PERMISSIONS"]).replace("0o", "")
-        self.add_small_entry(perm_frame, 0, 2, "FILE_PERMISSIONS", "File (e.g. 666):", val_override=p_val)
-
-        # --- ACTION BUTTON ---
-        ttk.Button(parent, text="SAVE SETTINGS & START", command=self.save_and_run).pack(pady=20, fill="x")
-
-    # --- GUI helper widgets ---
-    def add_path_row(self, parent, row, key, label, mode="file"):
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="e", padx=5, pady=2)
-        entry = ttk.Entry(parent)
-        entry.insert(0, str(CONFIG.get(key, "")))
-        entry.grid(row=row, column=1, sticky="ew", padx=5, pady=2)
-        parent.columnconfigure(1, weight=1)
-
-        button_frame = ttk.Frame(parent)
-        button_frame.grid(row=row, column=2, padx=2)
-
-        def browse_file():
-            res = filedialog.askopenfilename()
-            if res:
-                entry.delete(0, tk.END)
-                entry.insert(0, res)
-
-        def browse_folder():
-            res = filedialog.askdirectory()
-            if res:
-                entry.delete(0, tk.END)
-                entry.insert(0, res)
-
-        if mode == "both":
-            ttk.Button(button_frame, text="File", width=5, command=browse_file).pack(side="left", padx=1)
-            ttk.Button(button_frame, text="Folder", width=6, command=browse_folder).pack(side="left", padx=1)
-        else:
-            cmd = browse_file if mode is True or mode == "file" else browse_folder
-            ttk.Button(button_frame, text="...", width=3, command=cmd).pack()
-
-        self.entries[key] = entry
-
-    def add_small_entry(self, parent, row, col, key, label, val_override=None):
-        ttk.Label(parent, text=label).grid(row=row, column=col, sticky="e", padx=(10, 5), pady=2)
-        entry = ttk.Entry(parent, width=10)
-        val = val_override if val_override is not None else str(CONFIG.get(key, ""))
-        entry.insert(0, val)
-        entry.grid(row=row, column=col + 1, sticky="w", padx=0, pady=2)
-        self.entries[key] = entry
-
-    def add_checkbox(self, parent, row, col, key, label):
-        var = tk.BooleanVar(value=bool(CONFIG.get(key, False)))
-        ttk.Checkbutton(parent, text=label, variable=var).grid(row=row, column=col, columnspan=2, sticky="w", padx=10, pady=2)
-        self.entries[key] = var
-
-    # --- Domain filtering dialog ---
-    @staticmethod
-    def _normalize_domain(url: str) -> str:
-        try:
-            parsed = urlparse(url)
-            host = (parsed.netloc or "").strip().lower()
-            if host.startswith("www."):
-                host = host[4:]
-            # drop port if present
-            host = host.split(":")[0]
-            return host
-        except Exception:
-            return ""
-
-    def _collect_domains_from_mapping(self, mapping_path: str):
+    def _collect_domains_from_mapping(self, mapping_path):
         domains = set()
         try:
             url_mappings = load_url_mappings(mapping_path)
@@ -892,174 +901,395 @@ class ConfigGUI:
             url_mappings = {}
 
         for _, urls in url_mappings.items():
-            if not urls:
-                continue
+            if not urls: continue
             for u in urls:
-                if not u or str(u).lower() == "none":
-                    continue
-                d = self._normalize_domain(u)
-                if d:
-                    domains.add(d)
+                if not u or str(u).lower() == "none": continue
+                d = _domain_from_url(u)
+                if d: domains.add(d)
         return sorted(domains)
 
-    def open_domain_filter_dialog(self):
-        mapping_path = self.entries.get("URL_MAPPING_FILE").get() if "URL_MAPPING_FILE" in self.entries else CONFIG.get("URL_MAPPING_FILE", "")
-        if not mapping_path or not os.path.exists(mapping_path):
-            messagebox.showerror("Error", "URL mapping file not found. Please select a valid url_mapping.txt first.")
-            return
+    def enable_all(self):
+        for cb in self.checkboxes.values(): cb.setChecked(True)
 
-        # Ensure config keys exist
-        CONFIG.setdefault("DISABLED_DOMAINS", [])
-        disabled = set([d.lower() for d in CONFIG.get("DISABLED_DOMAINS", []) if d])
+    def disable_all(self):
+        for cb in self.checkboxes.values(): cb.setChecked(False)
 
-        domains = self._collect_domains_from_mapping(mapping_path)
-        if not domains:
-            messagebox.showinfo("No domains found", "No valid source domains were found in the mapping file.")
-            return
+    def save_and_close(self):
+        new_disabled = [d for d, cb in self.checkboxes.items() if not cb.isChecked()]
+        CONFIG["DISABLED_DOMAINS"] = sorted(set([d.lower() for d in new_disabled]))
+        
+        sz = self.size()
+        CONFIG["DOMAIN_FILTER_GEOMETRY"] = f"{sz.width()}x{sz.height()}"
+        save_config()
+        self.accept()
 
-        win = tk.Toplevel(self.root)
-        win.title("Domain Filters")
-        default_geom = "700x520"
-        geom = CONFIG.get("DOMAIN_FILTER_GEOMETRY") or default_geom
+class ConfigWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("ROM Downloader Configuration")
+        
+        # --- Force Dark Title Bar (Windows) ---
         try:
-            win.geometry(geom)
+            hwnd = self.winId()
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                int(hwnd), 20, ctypes.byref(ctypes.c_int(1)), 4
+            )
         except Exception:
-            win.geometry(default_geom)
-        win.minsize(600, 400)
-        win.resizable(True, True)
+            pass
 
-        ttk.Label(
-            win,
-            text=("Uncheck any domain you want to disable. "
-                  "Disabled domains will be skipped during crawling and downloading."),
-            wraplength=660
-        ).pack(pady=(10, 6), padx=10, anchor="w")
-
-        # Scrollable list
-        container = ttk.Frame(win)
-        container.pack(fill="both", expand=True, padx=10)
-
-        canvas = tk.Canvas(container, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
-        scroll_frame = ttk.Frame(canvas)
-
-        scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        # Mousewheel scrolling (Windows/macOS/Linux)
-        def _on_mousewheel(event):
-            # Windows: event.delta is multiples of 120
-            if hasattr(event, "delta") and event.delta:
-                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-            else:
-                # Linux uses Button-4/5
-                if event.num == 4:
-                    canvas.yview_scroll(-3, "units")
-                elif event.num == 5:
-                    canvas.yview_scroll(3, "units")
-
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
-        canvas.bind_all("<Button-4>", _on_mousewheel)
-        canvas.bind_all("<Button-5>", _on_mousewheel)
-
-        vars_map = {}
-        for i, dom in enumerate(domains):
-            v = tk.BooleanVar(value=(dom not in disabled))
-            cb = ttk.Checkbutton(scroll_frame, text=dom, variable=v)
-            cb.grid(row=i, column=0, sticky="w", padx=5, pady=2)
-            vars_map[dom] = v
-
-        btn_row = ttk.Frame(win)
-        btn_row.pack(fill="x", padx=10, pady=10)
-
-        def _persist_dialog_geometry():
+        # --- Window Geometry ---
+        geom = CONFIG.get("GUI_GEOMETRY")
+        geometry_set = False
+        if geom:
             try:
-                CONFIG["DOMAIN_FILTER_GEOMETRY"] = win.winfo_geometry()
-                save_config()
-            except Exception:
+                w, h = map(int, geom.split('x'))
+                self.resize(w, h)
+                geometry_set = True
+            except: 
                 pass
+        
+        if not geometry_set:
+            self.resize(550, 850)
 
-        def save_and_close():
-            new_disabled = [d for d, v in vars_map.items() if not v.get()]
-            CONFIG["DISABLED_DOMAINS"] = sorted(set([d.lower() for d in new_disabled]))
-            _persist_dialog_geometry()
-            save_config()
-            win.destroy()
+        self.inputs = {}
+        self.init_ui()
 
-        def enable_all():
-            for v in vars_map.values():
-                v.set(True)
+    def init_ui(self):
+        main_layout = QVBoxLayout()
+        self.setLayout(main_layout)
 
-        def disable_all():
-            for v in vars_map.values():
-                v.set(False)
+        # --- SCROLL AREA FOR CONFIGS (Fixed Height) ---
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(0)
+        
+        # Enforce the specific dimensions you requested
+        scroll.setMinimumWidth(520)
+        scroll.setFixedHeight(520) 
+        
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout(scroll_content)
+        scroll_layout.setContentsMargins(0,0,0,0)
+        scroll.setWidget(scroll_content)
+        
+        main_layout.addWidget(scroll)
 
-        ttk.Button(btn_row, text="Enable All", command=enable_all).pack(side="left")
-        ttk.Button(btn_row, text="Disable All", command=disable_all).pack(side="left", padx=(8, 0))
-        ttk.Button(btn_row, text="Save", command=save_and_close).pack(side="right")
+        # 1. Paths
+        group_paths = QGroupBox("Paths & Files")
+        layout_paths = QGridLayout()
+        group_paths.setLayout(layout_paths)
+        self.add_path_row(layout_paths, 0, "INPUT_PATH", "FixDATs Source (DAT/Folder):", mode="both")
+        self.add_path_row(layout_paths, 1, "DOWNLOAD_FOLDER", "Download Folder:", mode="dir")
+        self.add_path_row(layout_paths, 2, "URL_MAPPING_FILE", "URL Mapping File:", mode="file")
+        btn_domains = QPushButton("Edit Domain Filters")
+        btn_domains.clicked.connect(self.open_domain_filter)
+        layout_paths.addWidget(btn_domains, 3, 1, 1, 1)
+        scroll_layout.addWidget(group_paths)
 
-        def on_close():
-            _persist_dialog_geometry()
-            win.destroy()
+        # 2. Performance
+        group_perf = QGroupBox("Performance")
+        layout_perf = QGridLayout()
+        group_perf.setLayout(layout_perf)
+        self.add_input_pair(layout_perf, 0, 0, "MAIN_THREADS", "Game Threads:")
+        self.add_input_pair(layout_perf, 0, 2, "SUB_THREAD_WORKERS", "ROM Threads:")
+        scroll_layout.addWidget(group_perf)
 
-        win.protocol("WM_DELETE_WINDOW", on_close)
+        # 3. Network
+        group_net = QGroupBox("Network")
+        layout_net = QGridLayout()
+        group_net.setLayout(layout_net)
+        self.add_input_pair(layout_net, 0, 0, "TIMEOUT", "Timeout (s):")
+        self.add_input_pair(layout_net, 0, 2, "MAX_RETRIES", "Max Retries:")
+        self.add_input_pair(layout_net, 0, 4, "RETRY_DELAY", "Retry (s):")
+        scroll_layout.addWidget(group_net)
 
-    # --- Save and run ---
-    def save_and_run(self):
+        # 4. Scraping
+        group_scrape = QGroupBox("Scraping & Logic")
+        layout_scrape = QGridLayout()
+        group_scrape.setLayout(layout_scrape)
+        self.add_input_pair(layout_scrape, 0, 0, "FUZZY_THRESHOLD", "Fuzzy (0-1):")
+        self.add_input_pair(layout_scrape, 1, 0, "RECURSION_DEPTH", "Recurse:")
+        self.add_checkbox(layout_scrape, 0, 2, "DELETE_EMPTY_DATS", "Delete Empty DATs")
+        self.add_checkbox(layout_scrape, 1, 2, "INTERACTIVE_MODE", "Interactive Mode")
+        scroll_layout.addWidget(group_scrape)
+
+        # 5. Reporting
+        group_report = QGroupBox("Reporting")
+        layout_report = QGridLayout()
+        group_report.setLayout(layout_report)
+        self.add_checkbox(layout_report, 0, 0, "SHOW_NONE_DATS", "Show 'None' Skipped")
+        self.add_checkbox(layout_report, 0, 1, "SHOW_PROCESSED_DATS", "Show Processed")
+        self.add_checkbox(layout_report, 0, 2, "SHOW_DELETED_DATS", "Show Deleted")
+        scroll_layout.addWidget(group_report)
+
+        # 6. Permissions
+        group_perm = QGroupBox("Permissions (Octal)")
+        layout_perm = QGridLayout()
+        group_perm.setLayout(layout_perm)
+        f_val = oct(CONFIG["FOLDER_PERMISSIONS"]).replace("0o", "")
+        self.add_input_pair(layout_perm, 0, 0, "FOLDER_PERMISSIONS", "Folder:", val_override=f_val)
+        p_val = oct(CONFIG["FILE_PERMISSIONS"]).replace("0o", "")
+        self.add_input_pair(layout_perm, 0, 2, "FILE_PERMISSIONS", "File:", val_override=p_val)
+        scroll_layout.addWidget(group_perm)
+
+        # --- DOWNLOAD QUEUE TABLE ---
+        lbl_queue = QLabel("Active Downloads:")
+        lbl_queue.setStyleSheet("font-weight: bold; margin-top: 5px;")
+        main_layout.addWidget(lbl_queue)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(3)
+        self.table.setHorizontalHeaderLabels(["Filename", "Progress", "Speed"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)     
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Fixed)       
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)       
+        self.table.setColumnWidth(1, 150)
+        self.table.setColumnWidth(2, 100)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setAlternatingRowColors(True)
+        # CHANGED: Use minimum height so it can grow
+        self.table.setMinimumHeight(100) 
+        main_layout.addWidget(self.table)
+        
+        self.active_rows = {}
+
+        # --- LOG BOX SECTION ---
+        lbl_log = QLabel("Process Log:")
+        lbl_log.setStyleSheet("font-weight: bold; margin-top: 5px;")
+        main_layout.addWidget(lbl_log)
+
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        # CHANGED: Use minimum height so it can grow
+        self.log_box.setMinimumHeight(80)
+        self.log_box.setFont(QFont("Consolas", 9))
+        self.log_box.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4; border: 1px solid #3c3c3c;")
+        main_layout.addWidget(self.log_box)
+
+        # --- ACTION BUTTON ---
+        self.btn_start = QPushButton("SAVE SETTINGS && START")
+        self.btn_start.setFixedHeight(45)
+        self.btn_start.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        self.btn_start.clicked.connect(self.start_process)
+        main_layout.addWidget(self.btn_start)
+
+    # --- WIDGET HELPERS ---
+    def add_path_row(self, layout, row, key, label_text, mode="file"):
+        lbl = QLabel(label_text)
+        inp = QLineEdit()
+        inp.setText(str(CONFIG.get(key, "")))
+        self.inputs[key] = inp
+        
+        layout.addWidget(lbl, row, 0)
+        layout.addWidget(inp, row, 1)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.setContentsMargins(0,0,0,0)
+        
+        if mode == "both":
+            btn_file = QPushButton("File")
+            btn_folder = QPushButton("Folder")
+            btn_file.clicked.connect(lambda: self.browse(inp, "file"))
+            btn_folder.clicked.connect(lambda: self.browse(inp, "dir"))
+            btn_layout.addWidget(btn_file)
+            btn_layout.addWidget(btn_folder)
+        else:
+            btn = QPushButton("...")
+            btn.clicked.connect(lambda: self.browse(inp, mode))
+            btn_layout.addWidget(btn)
+        
+        container = QWidget()
+        container.setLayout(btn_layout)
+        layout.addWidget(container, row, 2)
+
+    def add_input_pair(self, layout, row, col, key, label_text, val_override=None):
+        lbl = QLabel(label_text)
+        inp = QLineEdit()
+        val = val_override if val_override is not None else str(CONFIG.get(key, ""))
+        inp.setText(val)
+        self.inputs[key] = inp
+        layout.addWidget(lbl, row, col)
+        layout.addWidget(inp, row, col+1)
+
+    def add_checkbox(self, layout, row, col, key, label_text):
+        chk = QCheckBox(label_text)
+        chk.setChecked(bool(CONFIG.get(key, False)))
+        self.inputs[key] = chk
+        layout.addWidget(chk, row, col)
+
+    def browse(self, input_widget, mode):
+        if mode == "file":
+            path, _ = QFileDialog.getOpenFileName(self, "Select File")
+        else:
+            path = QFileDialog.getExistingDirectory(self, "Select Folder")
+        if path: input_widget.setText(path)
+
+    def open_domain_filter(self):
+        mapping_path = self.inputs["URL_MAPPING_FILE"].text()
+        if not mapping_path or not os.path.exists(mapping_path):
+             QMessageBox.critical(self, "Error", "URL mapping file not found. Please select a valid url_mapping.txt first.")
+             return
+        dlg = DomainFilterDialog(self, mapping_path)
+        dlg.exec_()
+
+    def save_settings(self):
         try:
-            # Update CONFIG from GUI
-            CONFIG["INPUT_PATH"] = self.entries["INPUT_PATH"].get()
-            CONFIG["DOWNLOAD_FOLDER"] = self.entries["DOWNLOAD_FOLDER"].get()
-            CONFIG["URL_MAPPING_FILE"] = self.entries["URL_MAPPING_FILE"].get()
+            CONFIG["INPUT_PATH"] = self.inputs["INPUT_PATH"].text()
+            CONFIG["DOWNLOAD_FOLDER"] = self.inputs["DOWNLOAD_FOLDER"].text()
+            CONFIG["URL_MAPPING_FILE"] = self.inputs["URL_MAPPING_FILE"].text()
+            CONFIG["MAIN_THREADS"] = int(self.inputs["MAIN_THREADS"].text())
+            CONFIG["SUB_THREAD_WORKERS"] = int(self.inputs["SUB_THREAD_WORKERS"].text())
+            CONFIG["TIMEOUT"] = int(self.inputs["TIMEOUT"].text())
+            CONFIG["MAX_RETRIES"] = int(self.inputs["MAX_RETRIES"].text())
+            CONFIG["RETRY_DELAY"] = int(self.inputs["RETRY_DELAY"].text())
+            CONFIG["FUZZY_THRESHOLD"] = float(self.inputs["FUZZY_THRESHOLD"].text())
+            CONFIG["RECURSION_DEPTH"] = int(self.inputs["RECURSION_DEPTH"].text())
+            CONFIG["DELETE_EMPTY_DATS"] = self.inputs["DELETE_EMPTY_DATS"].isChecked()
+            CONFIG["INTERACTIVE_MODE"] = self.inputs["INTERACTIVE_MODE"].isChecked()
+            CONFIG["SHOW_NONE_DATS"] = self.inputs["SHOW_NONE_DATS"].isChecked()
+            CONFIG["SHOW_PROCESSED_DATS"] = self.inputs["SHOW_PROCESSED_DATS"].isChecked()
+            CONFIG["SHOW_DELETED_DATS"] = self.inputs["SHOW_DELETED_DATS"].isChecked()
+            CONFIG["FOLDER_PERMISSIONS"] = int(self.inputs["FOLDER_PERMISSIONS"].text(), 8)
+            CONFIG["FILE_PERMISSIONS"] = int(self.inputs["FILE_PERMISSIONS"].text(), 8)
 
-            CONFIG["MAIN_THREADS"] = int(self.entries["MAIN_THREADS"].get())
-            CONFIG["SUB_THREAD_WORKERS"] = int(self.entries["SUB_THREAD_WORKERS"].get())
-            CONFIG["TIMEOUT"] = int(self.entries["TIMEOUT"].get())
-            CONFIG["MAX_RETRIES"] = int(self.entries["MAX_RETRIES"].get())
-            CONFIG["RETRY_DELAY"] = int(self.entries["RETRY_DELAY"].get())
-            CONFIG["FUZZY_THRESHOLD"] = float(self.entries["FUZZY_THRESHOLD"].get())
-            CONFIG["RECURSION_DEPTH"] = int(self.entries["RECURSION_DEPTH"].get())
+            if not CONFIG["INPUT_PATH"] or not CONFIG["DOWNLOAD_FOLDER"] or not CONFIG["URL_MAPPING_FILE"]:
+                 QMessageBox.critical(self, "Error", "Please verify all paths are set.")
+                 return False
 
-            CONFIG["DELETE_EMPTY_DATS"] = self.entries["DELETE_EMPTY_DATS"].get()
-            CONFIG["INTERACTIVE_MODE"] = self.entries["INTERACTIVE_MODE"].get()
-
-            # Handle Octal Inputs
-            CONFIG["FOLDER_PERMISSIONS"] = int(self.entries["FOLDER_PERMISSIONS"].get(), 8)
-            CONFIG["FILE_PERMISSIONS"] = int(self.entries["FILE_PERMISSIONS"].get(), 8)
-
-            if not CONFIG["INPUT_PATH"]:
-                messagebox.showerror("Error", "Please select a FixDAT file/folder.")
-                return
-            if not CONFIG["DOWNLOAD_FOLDER"]:
-                messagebox.showerror("Error", "Please select a Download Path.")
-                return
-            if not CONFIG["URL_MAPPING_FILE"]:
-                messagebox.showerror("Error", "Please select a path for url_mapping.txt.")
-                return
-
-            # Persist geometry before starting
-            self._persist_geometry()
-
-            # SAVE CONFIG TO DISK
+            sz = self.size()
+            CONFIG["GUI_GEOMETRY"] = f"{sz.width()}x{sz.height()}"
             save_config()
-
-            self.root.destroy()
-            run_downloader()
-
+            return True
         except ValueError as e:
-            messagebox.showerror("Input Error", f"Invalid value: {e}")
+            QMessageBox.critical(self, "Input Error", f"Invalid value: {e}")
+            return False
 
+    def start_process(self):
+        # 1. Save Settings
+        if not self.save_settings():
+            return
+
+        # 2. UI Prep
+        self.btn_start.setEnabled(False)
+        self.btn_start.setText("PROCESSING...")
+        self.log_box.clear()
+        self.table.setRowCount(0)
+        self.active_rows.clear()
+        
+        # 3. Initialize Global Signals
+        global GUI_SIGNALS
+        GUI_SIGNALS = WorkerSignals()
+        GUI_SIGNALS.progress.connect(self.update_progress_row)
+        GUI_SIGNALS.finished.connect(self.remove_progress_row)
+
+        # 4. Redirect Output
+        self.redirector = StreamRedirector()
+        self.redirector.text_written.connect(self.update_log)
+        
+        self.original_stdout = sys.stdout
+        self.original_stderr = sys.stderr
+        sys.stdout = self.redirector
+        sys.stderr = self.redirector
+
+        # 5. Start Thread
+        self.worker = DownloadWorker()
+        self.worker.finished.connect(self.on_worker_finished)
+        self.worker.start()
+
+    def update_log(self, text):
+        # ANSI Color Parsing
+        ansi_map = {
+            '30': 'gray', '31': '#ff5555', '32': '#50fa7b', '33': '#f1fa8c', 
+            '34': '#bd93f9', '35': '#ff79c6', '36': '#8be9fd', '37': 'white', '0': 'white'
+        }
+
+        # Regex split by ANSI codes
+        parts = re.split(r'\x1b\[(\d+)m', text)
+        cursor = self.log_box.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        current_fmt = cursor.charFormat()
+        
+        for i, part in enumerate(parts):
+            if i % 2 == 0:
+                if part: cursor.insertText(part, current_fmt)
+            else:
+                code = part.split(';')[0]
+                if code in ansi_map:
+                    current_fmt.setForeground(QColor(ansi_map[code]))
+                elif code == '0':
+                    current_fmt.setForeground(QColor("white"))
+
+        self.log_box.ensureCursorVisible()
+
+    def update_progress_row(self, filename, percent, speed_str):
+        if filename not in self.active_rows:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            self.active_rows[filename] = row
+            
+            self.table.setItem(row, 0, QTableWidgetItem(filename))
+            
+            pbar = QProgressBar()
+            pbar.setValue(percent)
+            pbar.setAlignment(Qt.AlignCenter)
+            pbar.setStyleSheet("""
+                QProgressBar { border: 1px solid #555; border-radius: 3px; text-align: center; }
+                QProgressBar::chunk { background-color: #2a82da; width: 10px; }
+            """)
+            self.table.setCellWidget(row, 1, pbar)
+            self.table.setItem(row, 2, QTableWidgetItem(speed_str))
+        else:
+            row = self.active_rows[filename]
+            pbar = self.table.cellWidget(row, 1)
+            if pbar: pbar.setValue(percent)
+            self.table.setItem(row, 2, QTableWidgetItem(speed_str))
+
+    def remove_progress_row(self, filename):
+        if filename in self.active_rows:
+            row = self.active_rows[filename]
+            pbar = self.table.cellWidget(row, 1)
+            if pbar: 
+                pbar.setValue(100)
+                pbar.setStyleSheet("""
+                    QProgressBar { border: 1px solid #555; border-radius: 3px; text-align: center; }
+                    QProgressBar::chunk { background-color: #50fa7b; } 
+                """) 
+            self.table.setItem(row, 2, QTableWidgetItem("Done"))
+
+    def on_worker_finished(self):
+        sys.stdout = self.original_stdout
+        sys.stderr = self.original_stderr
+        self.btn_start.setEnabled(True)
+        self.btn_start.setText("SAVE SETTINGS && START")
+        QMessageBox.information(self, "Done", "Process Complete.")
+
+def set_dark_theme(app):
+    app.setStyle("Fusion")
+    dark_palette = QPalette()
+    dark_color = QColor(45, 45, 45)
+    
+    dark_palette.setColor(QPalette.Window, dark_color)
+    dark_palette.setColor(QPalette.WindowText, Qt.white)
+    dark_palette.setColor(QPalette.Base, QColor(25, 25, 25))
+    dark_palette.setColor(QPalette.AlternateBase, dark_color)
+    dark_palette.setColor(QPalette.ToolTipBase, Qt.white)
+    dark_palette.setColor(QPalette.ToolTipText, Qt.white)
+    dark_palette.setColor(QPalette.Text, Qt.white)
+    dark_palette.setColor(QPalette.Button, dark_color)
+    dark_palette.setColor(QPalette.ButtonText, Qt.white)
+    dark_palette.setColor(QPalette.BrightText, Qt.red)
+    dark_palette.setColor(QPalette.Link, QColor(42, 130, 218))
+    dark_palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
+    dark_palette.setColor(QPalette.HighlightedText, Qt.black)
+
+    app.setPalette(dark_palette)
+    app.setStyleSheet("QToolTip { color: #ffffff; background-color: #2a82da; border: 1px solid white; }")
 
 def main():
-    # Load saved config first
     load_config()
 
-    # If arguments are passed, use CLI mode
     if len(sys.argv) > 1:
+        # CLI Mode
         parser = argparse.ArgumentParser(description="DAT File Downloader/Scraper", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
         parser.add_argument('input_path', help="Path to DAT file or folder containing DATs")
         parser.add_argument('--output', default=CONFIG["DOWNLOAD_FOLDER"], help="Download destination folder")
@@ -1076,10 +1306,12 @@ def main():
         parser.add_argument('--folder-perm', type=lambda x: int(x, 8), default=CONFIG["FOLDER_PERMISSIONS"], help="Folder permissions in octal (e.g. 777)")
         parser.add_argument('--file-perm', type=lambda x: int(x, 8), default=CONFIG["FILE_PERMISSIONS"], help="File permissions in octal (e.g. 666)")
         parser.add_argument('--debug', action='store_true', help="Enable debug logging")
+        parser.add_argument('--show-none', action='store_true', help="Show list of DATs skipped due to 'none' mapping")
+        parser.add_argument('--show-processed', action='store_true', help="Show list of processed DATs at the end")
+        parser.add_argument('--show-deleted', action='store_true', help="Show list of deleted DATs at the end")
 
         args = parser.parse_args()
 
-        # Override Config with Args
         CONFIG["INPUT_PATH"] = args.input_path
         CONFIG["DOWNLOAD_FOLDER"] = args.output
         CONFIG["URL_MAPPING_FILE"] = args.mapping_file
@@ -1094,15 +1326,27 @@ def main():
         CONFIG["RECURSION_DEPTH"] = args.depth
         CONFIG["MAIN_THREADS"] = args.threads
         CONFIG["INTERACTIVE_MODE"] = args.interactive
+        CONFIG["SHOW_NONE_DATS"] = args.show_none
+        CONFIG["SHOW_PROCESSED_DATS"] = args.show_processed
+        CONFIG["SHOW_DELETED_DATS"] = args.show_deleted
 
         if args.debug: log.setLevel(logging.DEBUG)
 
         run_downloader()
     else:
-        # No arguments -> Launch GUI
-        root = tk.Tk()
-        app = ConfigGUI(root)
-        root.mainloop()
+        # GUI Mode
+        if hasattr(Qt, 'AA_EnableHighDpiScaling'):
+            QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+        if hasattr(Qt, 'AA_UseHighDpiPixmaps'):
+            QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+
+        app = QApplication(sys.argv)
+        set_dark_theme(app)
+
+        window = ConfigWindow()
+        window.show()
+        
+        sys.exit(app.exec_())
 
 if __name__ == "__main__":
     try:
@@ -1119,9 +1363,19 @@ if __name__ == "__main__":
         print("!" * 60)
         sys.exit(1)
     finally:
-        # Pause so the console window doesn't close immediately when double-clicked.
-        try:
-            print("\nPress Enter to exit...")
-            input()
-        except EOFError:
+        if len(sys.argv) == 1:
+            # If CLI mode, pause; if GUI mode, just exit.
             pass
+        else:
+            print(f"\n{Fore.RED}Press Enter to exit (auto-closing in 10 seconds)...{Style.RESET_ALL}")
+            try:
+                import msvcrt
+                start_time = time.time()
+                while time.time() - start_time < 10:
+                    if msvcrt.kbhit():
+                        msvcrt.getch()
+                        break
+                    time.sleep(0.1)
+            except ImportError:
+                pass     
+            os._exit(0)
