@@ -57,7 +57,7 @@ from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                                 QFileDialog, QCheckBox, QGroupBox, QMessageBox, 
                                 QScrollArea, QDialog, QDialogButtonBox, QGridLayout,
                                 QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView, 
-                                QProgressBar, QStyledItemDelegate)
+                                QProgressBar, QStyledItemDelegate, QInputDialog)
 from PyQt5.QtCore import Qt, QSettings, QThread, pyqtSignal, QObject
 from PyQt5.QtGui import QFont, QIcon, QPalette, QColor, QTextCursor
 
@@ -111,10 +111,11 @@ load_config()
 
 # --- GLOBAL SIGNALS BRIDGE ---
 class WorkerSignals(QObject):
-    progress = pyqtSignal(str, int, str) # Filename, Percent, Speed/Status
-    finished = pyqtSignal(str)           # Filename finished
+    progress = pyqtSignal(str, int, str)
+    finished = pyqtSignal(str)
+    input_request = pyqtSignal(str, object, dict)
 
-GUI_SIGNALS = None  # Will be initialized in the GUI
+GUI_SIGNALS = None
 
 # --- LOGGING SETUP ---
 log = logging.getLogger()
@@ -634,12 +635,27 @@ def _resolve_dat_source_urls(dat_name, url_mappings, available_links_cache, inte
     if needs_input:
         if not interactive_mode:
             return None
-        print(f"{Fore.YELLOW}>>> Missing URL for: {dat_name}{Style.RESET_ALL}")
-        user_input = input(f"{Fore.CYAN}Enter URL (or 'none' to skip): {Style.RESET_ALL}").strip()
+        
+        user_input = ""
+        
+        if GUI_SIGNALS:
+            event = threading.Event()
+            container = {}
+            GUI_SIGNALS.input_request.emit(dat_name, event, container)
+            event.wait()
+            user_input = container.get("text", "").strip()
+        else:
+            print(f"{Fore.YELLOW}>>> Missing URL for: {dat_name}{Style.RESET_ALL}")
+            try:
+                user_input = input(f"{Fore.CYAN}Enter URL (or 'none' to skip): {Style.RESET_ALL}").strip()
+            except EOFError:
+                user_input = "none"
+
         if not user_input or user_input.lower() == 'none':
             url_mappings[dat_name] = ['none']
             save_url_mappings(CONFIG["URL_MAPPING_FILE"], url_mappings)
             return None
+            
         url_mappings[dat_name] = [user_input]
         save_url_mappings(CONFIG["URL_MAPPING_FILE"], url_mappings)
         return _resolve_dat_source_urls(dat_name, url_mappings, available_links_cache, interactive_mode, disabled_domains)
@@ -1181,6 +1197,7 @@ class ConfigWindow(QWidget):
         GUI_SIGNALS = WorkerSignals()
         GUI_SIGNALS.progress.connect(self.update_progress_row)
         GUI_SIGNALS.finished.connect(self.remove_progress_row)
+        GUI_SIGNALS.input_request.connect(self.handle_input_request)
 
         # 4. Redirect Output
         self.redirector = StreamRedirector()
@@ -1262,6 +1279,17 @@ class ConfigWindow(QWidget):
         self.btn_start.setEnabled(True)
         self.btn_start.setText("SAVE SETTINGS && START")
         QMessageBox.information(self, "Done", "Process Complete.")
+
+    def handle_input_request(self, dat_name, event, container):
+            text, ok = QInputDialog.getText(self, "Missing URL Mapping", 
+                                            f"The following DAT has no URL mapped:\n\n{dat_name}\n\nEnter source URL (or leave empty to skip):", 
+                                            QLineEdit.Normal, "")
+            if ok and text.strip():
+                container["text"] = text.strip()
+            else:
+                container["text"] = "none"
+                
+            event.set()
 
 def set_dark_theme(app):
     app.setStyle("Fusion")
