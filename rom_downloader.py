@@ -14,6 +14,9 @@ from urllib.parse import urljoin, urlparse, unquote, urlunparse
 from difflib import get_close_matches
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# --- VERSION ---
+VERSION = "0.2.1"
+
 # --- DEPENDENCY CHECK ---
 def check_dependencies():
     """Checks for required third-party libraries."""
@@ -111,7 +114,7 @@ load_config()
 
 # --- GLOBAL SIGNALS BRIDGE ---
 class WorkerSignals(QObject):
-    progress = pyqtSignal(str, int, str)
+    progress = pyqtSignal(str, int, str, str) # Filename, Percent, SizeStr, SpeedStr
     finished = pyqtSignal(str)
     input_request = pyqtSignal(str, object, dict)
 
@@ -487,13 +490,19 @@ def download_file(url, destination_path, file_display_name="Unknown"):
                         file.write(chunk)
                         downloaded += len(chunk)
                         
-                        # Calculate percentage and speed
+                        # Calculate percentage, size and speed
                         percent = int((downloaded / total_size) * 100) if total_size > 0 else 0
                         elapsed = time.time() - start_time
                         speed_mb = (downloaded / (1024 * 1024)) / elapsed if elapsed > 0 else 0
                         status_text = f"{speed_mb:.1f} MB/s"
                         
-                        GUI_SIGNALS.progress.emit(file_display, percent, status_text)
+                        # UPDATED: Format size string
+                        current_mb = downloaded / (1024 * 1024)
+                        total_mb = total_size / (1024 * 1024)
+                        size_str = f"{current_mb:.1f} / {total_mb:.1f} MB"
+                        
+                        # UPDATED: Emit with size string
+                        GUI_SIGNALS.progress.emit(file_display, percent, size_str, status_text)
             else:
                 # CLI Mode: Use TQDM
                 with tqdm(total=total_size, unit='B', unit_scale=True, desc=f"{Fore.BLUE}{file_display[:20]:<20}{Style.RESET_ALL}", leave=False, ncols=100) as bar:
@@ -717,14 +726,14 @@ def run_downloader():
         source_urls = _resolve_dat_source_urls(dat_name, url_mappings, available_links_cache, CONFIG["INTERACTIVE_MODE"], disabled_domains)
         
         if dat_name not in url_mappings or not url_mappings[dat_name]:
-            source_urls = _resolve_dat_source_urls(dat_name, url_mappings, available_links_cache, CONFIG["INTERACTIVE_MODE"], disabled_domains)
+             source_urls = _resolve_dat_source_urls(dat_name, url_mappings, available_links_cache, CONFIG["INTERACTIVE_MODE"], disabled_domains)
         else:
-            source_urls = _resolve_dat_source_urls(dat_name, url_mappings, available_links_cache, False, disabled_domains)
+             source_urls = _resolve_dat_source_urls(dat_name, url_mappings, available_links_cache, False, disabled_domains)
 
         if not source_urls:
             if dat_name in url_mappings and url_mappings[dat_name] and url_mappings[dat_name] != ['none']:
                 log.warning(f"{Fore.RED}[FAIL] Mapping exists but no links found. Check the URL content: {url_mappings[dat_name]}{Style.RESET_ALL}")
-            elif url_mappings[dat_name] == ['none']:
+            elif url_mappings.get(dat_name) == ['none']:
                 log.warning(f"{Fore.RED}[SKIP] URL for '{dat_name}' mapped as none on url_mappings.txt{Style.RESET_ALL}")
                 mapping_none_dats.append(dat_name)
             else:
@@ -942,7 +951,8 @@ class DomainFilterDialog(QDialog):
 class ConfigWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ROM Downloader Configuration")
+        # UPDATED: Added Version to Title
+        self.setWindowTitle(f"ROM Downloader Configuration v{VERSION}")
         
         # --- Force Dark Title Bar (Windows) ---
         try:
@@ -1054,13 +1064,15 @@ class ConfigWindow(QWidget):
         main_layout.addWidget(lbl_queue)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(3)
-        self.table.setHorizontalHeaderLabels(["Filename", "Progress", "Speed"])
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["Filename", "Size", "Progress", "Speed"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)     
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Fixed)       
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)       
-        self.table.setColumnWidth(1, 150)
-        self.table.setColumnWidth(2, 100)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Fixed)       
+        self.table.setColumnWidth(1, 140) # Size column
+        self.table.setColumnWidth(2, 120) # Progress Bar
+        self.table.setColumnWidth(3, 90)  # Speed
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
         # CHANGED: Use minimum height so it can grow
@@ -1238,13 +1250,14 @@ class ConfigWindow(QWidget):
 
         self.log_box.ensureCursorVisible()
 
-    def update_progress_row(self, filename, percent, speed_str):
+    def update_progress_row(self, filename, percent, size_str, speed_str):
         if filename not in self.active_rows:
             row = self.table.rowCount()
             self.table.insertRow(row)
             self.active_rows[filename] = row
             
             self.table.setItem(row, 0, QTableWidgetItem(filename))
+            self.table.setItem(row, 1, QTableWidgetItem(size_str))
             
             pbar = QProgressBar()
             pbar.setValue(percent)
@@ -1253,25 +1266,27 @@ class ConfigWindow(QWidget):
                 QProgressBar { border: 1px solid #555; border-radius: 3px; text-align: center; }
                 QProgressBar::chunk { background-color: #2a82da; width: 10px; }
             """)
-            self.table.setCellWidget(row, 1, pbar)
-            self.table.setItem(row, 2, QTableWidgetItem(speed_str))
+            self.table.setCellWidget(row, 2, pbar)
+            self.table.setItem(row, 3, QTableWidgetItem(speed_str))
+            self.table.scrollToBottom()
         else:
             row = self.active_rows[filename]
-            pbar = self.table.cellWidget(row, 1)
+            pbar = self.table.cellWidget(row, 2)
+            self.table.setItem(row, 1, QTableWidgetItem(size_str))
             if pbar: pbar.setValue(percent)
-            self.table.setItem(row, 2, QTableWidgetItem(speed_str))
+            self.table.setItem(row, 3, QTableWidgetItem(speed_str))
 
     def remove_progress_row(self, filename):
         if filename in self.active_rows:
             row = self.active_rows[filename]
-            pbar = self.table.cellWidget(row, 1)
+            pbar = self.table.cellWidget(row, 2)
             if pbar: 
                 pbar.setValue(100)
                 pbar.setStyleSheet("""
                     QProgressBar { border: 1px solid #555; border-radius: 3px; text-align: center; }
                     QProgressBar::chunk { background-color: #50fa7b; } 
                 """) 
-            self.table.setItem(row, 2, QTableWidgetItem("Done"))
+            self.table.setItem(row, 3, QTableWidgetItem("Done"))
 
     def on_worker_finished(self):
         sys.stdout = self.original_stdout
